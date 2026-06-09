@@ -9,6 +9,7 @@ Endpoints:
 """
 
 import os
+import re
 import json
 import base64
 import hmac
@@ -181,8 +182,26 @@ def resolve_slack_user(user_id: str) -> str:
     return user_id
 
 
+# Slack encodes mentions/links as tokens like <@U123>, <#C123|general>,
+# <!here>, and <http://url|label>. Translate them to readable text.
+_USER_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
+_CHANNEL_RE = re.compile(r"<#[A-Z0-9]+\|([^>]+)>")
+_SPECIAL_RE = re.compile(r"<!([^>|]+)(?:\|([^>]+))?>")
+_LINK_RE = re.compile(r"<(https?://[^|>]+)(?:\|([^>]+))?>")
+
+
+def clean_slack_text(text: str) -> str:
+    if not text:
+        return ""
+    text = _USER_RE.sub(lambda m: f"@{resolve_slack_user(m.group(1))}", text)
+    text = _CHANNEL_RE.sub(lambda m: f"#{m.group(1)}", text)
+    text = _SPECIAL_RE.sub(lambda m: f"@{m.group(2) or m.group(1)}", text)
+    text = _LINK_RE.sub(lambda m: m.group(2) or m.group(1), text)
+    return text
+
+
 def handle_slack_message(event: dict):
-    text = event.get("text", "")
+    text = clean_slack_text(event.get("text", ""))
     sender = resolve_slack_user(event.get("user", ""))
     task = extract_task(text)
     if task:
