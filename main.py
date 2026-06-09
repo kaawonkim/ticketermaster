@@ -15,12 +15,16 @@ import hmac
 import hashlib
 import time
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+
+from zoneinfo import ZoneInfo
 
 import httpx
 import gspread
 from google.oauth2.service_account import Credentials
 from fastapi import FastAPI, Request, BackgroundTasks, Response
+
+PACIFIC = ZoneInfo("America/Los_Angeles")  # auto-handles PST/PDT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("task-bot")
@@ -67,13 +71,13 @@ def append_task(task: dict, source: str, sender: str):
     ws = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
     row = [
-        task.get("status", "To Do"),                 # A  Status
-        task.get("due_date", ""),                     # B  Due Date
-        task.get("description", ""),                  # C  Description
-        task.get("assigned_to") or sender or "",      # D  Assigned To
-        source,                                        # E  Source (Slack/Outlook)
-        sender or "",                                  # F  Sender
-        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),  # G  Date Added
+        task.get("description", ""),                              # A  Item
+        task.get("assigned_to") or sender or "",                 # B  Person Assigned
+        task.get("due_date", ""),                                # C  Due Date
+        datetime.now(PACIFIC).strftime("%Y-%m-%d %I:%M %p %Z"),  # D  Time Assigned
+        sender or "",                                            # E  Assigner
+        task.get("status", "To Do"),                             # F  Action
+        source,                                                  # G  Source
     ]
     ws.append_row(row, value_input_option="USER_ENTERED")
     log.info("Added task from %s: %s", source, task.get("description", "")[:80])
@@ -101,7 +105,7 @@ def extract_task(text: str):
     if not text or not text.strip():
         return None
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(PACIFIC).strftime("%Y-%m-%d")
     user_msg = f"Current date: {today}\n\nMessage:\n{text}"
 
     try:
