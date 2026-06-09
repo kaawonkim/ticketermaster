@@ -15,6 +15,7 @@ import base64
 import hmac
 import hashlib
 import time
+import threading
 import logging
 from datetime import datetime
 
@@ -89,30 +90,32 @@ def append_task(task: dict, source: str, sender: str):
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
     "You extract actionable tasks from workplace messages and emails. "
+    "The text may be several messages from one person stitched together, and may "
+    "contain zero, one, or several distinct tasks. "
     "Respond with ONLY a JSON object and nothing else — no prose, no code fences. "
-    "Schema: "
-    '{"is_task": boolean, '
-    '"description": string, '
-    '"due_date": string, '
-    '"assigned_to": string (the person responsible, or "" if unclear)}. '
+    'Schema: {"tasks": [ '
+    '{"description": string, "due_date": string, "assigned_to": string} ] }. '
+    "Return an empty array if there is no actionable task. Merge fragments that "
+    "describe the SAME task into one entry; only create separate entries for "
+    "genuinely different tasks. "
     "For due_date: if a specific time is given, use 'YYYY-MM-DD h:mm AM/PM' "
     "(e.g. '2026-06-12 4:00 PM'); if only a day is given, use 'YYYY-MM-DD'; "
     "if no deadline is stated, use ''. "
-    "Set is_task to false for greetings, small talk, pure FYIs, newsletters, "
-    "or anything with no clear action someone must take. Resolve relative dates "
-    "and times (e.g. 'Friday', 'tomorrow', '4pm Friday', 'EOD') against the "
-    "provided current date and time."
+    "assigned_to is the person responsible, or '' if unclear. "
+    "Treat greetings, small talk, pure FYIs, and newsletters as no task. "
+    "Resolve relative dates and times (e.g. 'Friday', 'tomorrow', '4pm Friday', "
+    "'EOD') against the provided current date and time."
 )
 
 
-def extract_task(text: str):
-    """Return a task dict if the message contains one, else None."""
+def extract_tasks(text: str):
+    """Return a list of task dicts found in the text (possibly empty)."""
     if not text or not text.strip():
-        return None
+        return []
 
     now = datetime.now(PACIFIC)
     today = now.strftime("%A, %Y-%m-%d %I:%M %p %Z")
-    user_msg = f"Current date and time: {today}\n\nMessage:\n{text}"
+    user_msg = f"Current date and time: {today}\n\nMessage(s):\n{text}"
 
     try:
         resp = httpx.post(
@@ -124,7 +127,7 @@ def extract_task(text: str):
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 400,
+                "max_tokens": 800,
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user_msg}],
             },
@@ -140,10 +143,10 @@ def extract_task(text: str):
             out = out.strip("`")
             out = out[4:].strip() if out.lower().startswith("json") else out.strip()
         parsed = json.loads(out)
-        return parsed if parsed.get("is_task") else None
+        return [t for t in parsed.get("tasks", []) if t.get("description")]
     except Exception as e:
         log.exception("Claude extraction failed: %s", e)
-        return None
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -205,11 +208,43 @@ def clean_slack_text(text: str) -> str:
     return text
 
 
-def handle_slack_message(event: dict):
+# --- Message buffering -----------------------------------------------------
+# Someone may type one task across several quick messages. We hold messages
+# from the same person in the same channel for a few seconds of quiet, then
+# process the whole burst together. SLACK_BUFFER_SECONDS controls the wait.
+_BUFFER_WINDOW = float(os.environ.get("SLACK_BUFFER_SECONDS", "8"))
+_buffers = {}            # key -> list of message texts
+_timers = {}             # key -> active threading.Timer
+_buffer_lock = threading.Lock()
+
+
+def buffer_slack_message(event: dict):
+    """Collect a message and (re)start the quiet-period timer for that sender."""
     text = clean_slack_text(event.get("text", ""))
-    sender = resolve_slack_user(event.get("user", ""))
-    task = extract_task(text)
-    if task:
+    if not text.strip():
+        return
+    key = f"{event.get('channel', '')}:{event.get('user', '')}"
+    user_id = event.get("user", "")
+    with _buffer_lock:
+        _buffers.setdefault(key, []).append(text)
+        if key in _timers:
+            _timers[key].cancel()          # reset the clock; they're still typing
+        timer = threading.Timer(_BUFFER_WINDOW, flush_buffer, args=(key, user_id))
+        timer.daemon = True
+        _timers[key] = timer
+        timer.start()
+
+
+def flush_buffer(key: str, user_id: str):
+    """Fired after the quiet period: process the whole burst as one chunk."""
+    with _buffer_lock:
+        texts = _buffers.pop(key, [])
+        _timers.pop(key, None)
+    if not texts:
+        return
+    combined = "\n".join(texts)
+    sender = resolve_slack_user(user_id)
+    for task in extract_tasks(combined):
         append_task(task, source="Slack", sender=sender)
 
 
@@ -239,7 +274,7 @@ async def slack_webhook(request: Request, background: BackgroundTasks):
             and not event.get("bot_id")       # ignore other bots
             and not event.get("subtype")      # ignore edits/joins/etc.
         ):
-            background.add_task(handle_slack_message, event)
+            background.add_task(buffer_slack_message, event)
 
     return Response(status_code=200)
 
@@ -279,8 +314,7 @@ def handle_outlook_notification(note: dict):
         subject = msg.get("subject", "")
         preview = msg.get("bodyPreview", "")
         sender = ((msg.get("from") or {}).get("emailAddress") or {}).get("name", "")
-        task = extract_task(f"Subject: {subject}\n\n{preview}")
-        if task:
+        for task in extract_tasks(f"Subject: {subject}\n\n{preview}"):
             append_task(task, source="Outlook", sender=sender)
     except Exception as e:
         log.exception("Outlook handling failed: %s", e)
