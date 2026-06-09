@@ -93,11 +93,15 @@ SYSTEM_PROMPT = (
     "Schema: "
     '{"is_task": boolean, '
     '"description": string, '
-    '"due_date": string (YYYY-MM-DD, or "" if none stated), '
+    '"due_date": string, '
     '"assigned_to": string (the person responsible, or "" if unclear)}. '
+    "For due_date: if a specific time is given, use 'YYYY-MM-DD h:mm AM/PM' "
+    "(e.g. '2026-06-12 4:00 PM'); if only a day is given, use 'YYYY-MM-DD'; "
+    "if no deadline is stated, use ''. "
     "Set is_task to false for greetings, small talk, pure FYIs, newsletters, "
     "or anything with no clear action someone must take. Resolve relative dates "
-    "(e.g. 'Friday', 'tomorrow', 'EOD') against the provided current date."
+    "and times (e.g. 'Friday', 'tomorrow', '4pm Friday', 'EOD') against the "
+    "provided current date and time."
 )
 
 
@@ -106,8 +110,9 @@ def extract_task(text: str):
     if not text or not text.strip():
         return None
 
-    today = datetime.now(PACIFIC).strftime("%Y-%m-%d")
-    user_msg = f"Current date: {today}\n\nMessage:\n{text}"
+    now = datetime.now(PACIFIC)
+    today = now.strftime("%A, %Y-%m-%d %I:%M %p %Z")
+    user_msg = f"Current date and time: {today}\n\nMessage:\n{text}"
 
     try:
         resp = httpx.post(
