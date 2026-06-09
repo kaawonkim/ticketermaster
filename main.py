@@ -284,4 +284,17 @@ async def outlook_webhook(request: Request, background: BackgroundTasks):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "task-bot"}
+    # Diagnostic: shows which variables the running app can actually see.
+    # Reports only presence + length, never the secret values themselves.
+    expected = [
+        "ANTHROPIC_API_KEY",
+        "SLACK_SIGNING_SECRET",
+        "SLACK_BOT_TOKEN",
+        "GOOGLE_SHEET_ID",
+        "GOOGLE_SERVICE_ACCOUNT_JSON",
+    ]
+    env_status = {
+        k: {"present": bool(os.environ.get(k, "")), "length": len(os.environ.get(k, ""))}
+        for k in expected
+    }
+    return {"status": "ok", "service": "task-bot", "env": env_status}
