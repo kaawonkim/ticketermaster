@@ -53,19 +53,24 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 def format_date(date_str: str) -> str:
     """Convert a date string from Claude into 'Monday (6/15/2026)'
-    or 'Monday (6/15/2026) @ 11:30 AM PST' if a time is present."""
+    or 'Monday (6/15/2026) @ 11:30 AM PST' if a time is present.
+    Shorthand like 'EOD', 'ASAP', 'EOW' are passed through as-is."""
     if not date_str:
         return ""
+    # Pass through plain shorthand that shouldn't be parsed as a date
+    SHORTHANDS = {"EOD", "ASAP", "EOW", "TBD"}
+    if date_str.strip().upper() in SHORTHANDS:
+        return date_str.strip().upper()
     # Try with time first (Claude returns 'YYYY-MM-DD h:mm AM/PM')
     for fmt in ("%Y-%m-%d %I:%M %p", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(date_str.strip(), fmt)
-            month = str(dt.month)
-            day   = str(dt.day)
-            year  = str(dt.year)
-            hour  = str(dt.hour % 12 or 12)
+            month  = str(dt.month)
+            day    = str(dt.day)
+            year   = str(dt.year)
+            hour   = str(dt.hour % 12 or 12)
             minute = dt.strftime("%M")
-            ampm  = dt.strftime("%p")
+            ampm   = dt.strftime("%p")
             return f"{dt.strftime('%A')} ({month}/{day}/{year}) @ {hour}:{minute} {ampm} PST"
         except ValueError:
             pass
@@ -152,7 +157,9 @@ SYSTEM_PROMPT = (
     "suggests someone should do something, treat it as a task. "
     "Merge fragments that describe the SAME task into one entry; only create separate "
     "entries for genuinely different tasks. "
-    "For due_date: if a specific time is given, use 'YYYY-MM-DD h:mm AM/PM' "
+    "For due_date: if the message says 'EOD', return exactly 'EOD'; "
+    "if it says 'ASAP', return 'ASAP'; if it says 'end of week' or 'EOW', return 'EOW'. "
+    "Otherwise, if a specific time is given, use 'YYYY-MM-DD h:mm AM/PM' "
     "(e.g. '2026-06-12 4:00 PM'); if only a day is given, use 'YYYY-MM-DD'; "
     "if no deadline is stated, use ''. "
     "assigned_to: use the name of the person responsible if mentioned or clearly implied. "
