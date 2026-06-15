@@ -68,9 +68,12 @@ def append_task(task: dict, source: str, sender: str):
     gc     = gspread.authorize(creds)
     ws     = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
+    # CHANGED: fall back to "Admin" if no one is assigned
+    assigned = task.get("assigned_to") or "Admin"
+
     row = [
         task.get("description", ""),                              # A  Action
-        task.get("assigned_to") or sender or "",                  # B  Person Assigned
+        assigned,                                                 # B  Person Assigned
         task.get("due_date", ""),                                 # C  Due Date (PST)
         datetime.now(PACIFIC).strftime("%Y-%m-%d %I:%M %p %Z"),  # D  Time Assigned
         sender or "",                                             # E  Assigner
@@ -85,7 +88,6 @@ def append_task(task: dict, source: str, sender: str):
 # Claude task extraction
 # ---------------------------------------------------------------------------
 
-# CHANGED: Loosened the prompt so Claude captures more borderline messages.
 SYSTEM_PROMPT = (
     "You extract actionable tasks from workplace messages and emails. "
     "The text may be several messages from one person stitched together, and may "
@@ -103,7 +105,9 @@ SYSTEM_PROMPT = (
     "For due_date: if a specific time is given, use 'YYYY-MM-DD h:mm AM/PM' "
     "(e.g. '2026-06-12 4:00 PM'); if only a day is given, use 'YYYY-MM-DD'; "
     "if no deadline is stated, use ''. "
-    "assigned_to is the person responsible, or '' if unclear. "
+    "assigned_to: use the name of the person responsible if mentioned or clearly implied. "
+    "If the message is directed at a specific person (e.g. '@John can you...'), assign it to them. "
+    "If truly unclear, leave assigned_to as '' and the system will assign it to Admin. "
     "Resolve relative dates and times (e.g. 'Friday', 'tomorrow', '4pm Friday', "
     "'EOD') against the provided current date and time."
 )
@@ -194,6 +198,28 @@ def resolve_slack_user(user_id: str) -> str:
     return user_id
 
 
+# CHANGED: new function to look up the channel name from its ID
+def resolve_slack_channel(channel_id: str) -> str:
+    """Convert a Slack channel ID (e.g. C12345) to its name (e.g. #general)."""
+    if not channel_id or not SLACK_BOT_TOKEN:
+        return "Slack"
+    try:
+        r = httpx.get(
+            "https://slack.com/api/conversations.info",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            params={"channel": channel_id},
+            timeout=10,
+        )
+        d = r.json()
+        if d.get("ok"):
+            name = d["channel"].get("name", "")
+            if name:
+                return f"Slack #{name}"
+    except Exception:
+        log.warning("Could not resolve Slack channel %s", channel_id)
+    return "Slack"
+
+
 _USER_RE    = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
 _CHANNEL_RE = re.compile(r"<#[A-Z0-9]+\|([^>]+)>")
 _SPECIAL_RE = re.compile(r"<!([^>|]+)(?:\|([^>]+))?>")
@@ -225,8 +251,6 @@ def buffer_slack_message(event: dict):
 
     channel  = event.get("channel", "")
     user_id  = event.get("user", "")
-    # CHANGED: include thread_ts in the key so thread replies are buffered
-    # separately from the parent channel, avoiding mixing contexts.
     thread   = event.get("thread_ts", event.get("ts", ""))
     key      = f"{channel}:{user_id}:{thread}"
 
@@ -234,13 +258,14 @@ def buffer_slack_message(event: dict):
         _buffers.setdefault(key, []).append(text)
         if key in _timers:
             _timers[key].cancel()
-        timer = threading.Timer(_BUFFER_WINDOW, flush_buffer, args=(key, user_id))
+        # CHANGED: pass channel_id into flush_buffer so we can resolve the name
+        timer = threading.Timer(_BUFFER_WINDOW, flush_buffer, args=(key, user_id, channel))
         timer.daemon = True
         _timers[key] = timer
         timer.start()
 
 
-def flush_buffer(key: str, user_id: str):
+def flush_buffer(key: str, user_id: str, channel_id: str = ""):
     with _buffer_lock:
         texts = _buffers.pop(key, [])
         _timers.pop(key, None)
@@ -248,8 +273,10 @@ def flush_buffer(key: str, user_id: str):
         return
     combined = "\n".join(texts)
     sender   = resolve_slack_user(user_id)
+    # CHANGED: resolve channel name for the source column
+    source   = resolve_slack_channel(channel_id)
     for task in extract_tasks(combined):
-        append_task(task, source="Slack", sender=sender)
+        append_task(task, source=source, sender=sender)
 
 
 @app.post("/webhook/slack")
@@ -274,8 +301,6 @@ async def slack_webhook(request: Request, background: BackgroundTasks):
         event = payload.get("event", {})
         event_type = event.get("type", "")
 
-        # CHANGED: also handle `message` events that are thread replies
-        # (they have a thread_ts different from ts) in addition to top-level messages.
         is_message = event_type == "message"
         is_reply   = event_type == "message" and event.get("thread_ts") and event.get("thread_ts") != event.get("ts")
 
