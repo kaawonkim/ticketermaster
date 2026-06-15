@@ -158,8 +158,31 @@ def append_task(task: dict, source: str, sender: str, channel: str = ""):
     col_a = ws.col_values(1)  # all values in column A
     next_row = len(col_a) + 1  # first row after last non-empty cell in col A
 
-    # Write directly to that row
+    # Write task data to columns A-G
     ws.update(f"A{next_row}:G{next_row}", [row_data], value_input_option="USER_ENTERED")
+
+    # Insert a checkbox in column H for the Done column
+    sheet_id = ws._properties["sheetId"]
+    gc.batch_update(GOOGLE_SHEET_ID, {"requests": [
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": next_row - 1,
+                    "endRowIndex": next_row,
+                    "startColumnIndex": 7,
+                    "endColumnIndex": 8,
+                },
+                "cell": {
+                    "dataValidation": {
+                        "condition": {"type": "BOOLEAN"},
+                        "strict": True,
+                    }
+                },
+                "fields": "dataValidation",
+            }
+        }
+    ]})
     log.info("Added task at row %d from %s: %s", next_row, source, task.get("description", "")[:80])
 
 # ---------------------------------------------------------------------------
