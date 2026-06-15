@@ -48,6 +48,40 @@ GOOGLE_SHEET_ID       = os.environ.get("GOOGLE_SHEET_ID", "")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def format_date(date_str: str) -> str:
+    """Convert a date string from Claude into 'Monday (6/15/2026)' or
+    'Monday (6/15/2026) @ 11:30 AM PST' depending on whether a time is present."""
+    if not date_str:
+        return ""
+    # Try with time first
+    for fmt in ("%Y-%m-%d %I:%M %p", "%Y-%m-%d %H:%M"):
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            return dt.strftime("%A (%-m/%-d/%Y) @ %-I:%M %p PST")
+        except ValueError:
+            pass
+    # Try date only
+    try:
+        dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        return dt.strftime("%A (%-m/%-d/%Y)")
+    except ValueError:
+        pass
+    # Return as-is if we can't parse it
+    return date_str
+
+def format_assigned_time() -> str:
+    """Current Pacific time formatted as 'Monday (6/15/2026) @ 11:30 AM PST'."""
+    now = datetime.now(PACIFIC)
+    return now.strftime("%A (%-m/%-d/%Y) @ %-I:%M %p PST")
+
+def format_channel_name(raw: str) -> str:
+    """Convert a Slack channel name like 'general-tasks' to 'General Tasks'."""
+    return " ".join(word.capitalize() for word in raw.replace("-", " ").replace("_", " ").split())
+
+# ---------------------------------------------------------------------------
 # Google Sheets
 # ---------------------------------------------------------------------------
 
@@ -61,24 +95,23 @@ def _service_account_info():
         return json.loads(base64.b64decode(raw).decode("utf-8"))
 
 
-def append_task(task: dict, source: str, sender: str):
+def append_task(task: dict, source: str, sender: str, channel: str = ""):
     """Append one task as a row in the Google Sheet."""
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds  = Credentials.from_service_account_info(_service_account_info(), scopes=scopes)
     gc     = gspread.authorize(creds)
     ws     = gc.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-    # CHANGED: fall back to "Admin" if no one is assigned
     assigned = task.get("assigned_to") or "Admin"
 
     row = [
-        task.get("description", ""),                              # A  Action
-        assigned,                                                 # B  Person Assigned
-        task.get("due_date", ""),                                 # C  Due Date (PST)
-        datetime.now(PACIFIC).strftime("%Y-%m-%d %I:%M %p %Z"),  # D  Time Assigned
-        sender or "",                                             # E  Assigner
-        task.get("status", "To Do"),                              # F  Type
-        source,                                                   # G  Source
+        task.get("description", ""),   # A  Action
+        assigned,                      # B  Person Assigned
+        format_date(task.get("due_date", "")),  # C  Due Date (PST)
+        format_assigned_time(),        # D  Time Assigned
+        sender or "",                  # E  Assigner
+        channel,                       # F  Channel
+        source,                        # G  Source
     ]
 
     ws.append_row(row, value_input_option="USER_ENTERED")
@@ -198,11 +231,10 @@ def resolve_slack_user(user_id: str) -> str:
     return user_id
 
 
-# CHANGED: new function to look up the channel name from its ID
 def resolve_slack_channel(channel_id: str) -> str:
-    """Convert a Slack channel ID (e.g. C12345) to its name (e.g. #general)."""
+    """Convert a Slack channel ID to a clean name like 'General Tasks'."""
     if not channel_id or not SLACK_BOT_TOKEN:
-        return "Slack"
+        return ""
     try:
         r = httpx.get(
             "https://slack.com/api/conversations.info",
@@ -212,12 +244,12 @@ def resolve_slack_channel(channel_id: str) -> str:
         )
         d = r.json()
         if d.get("ok"):
-            name = d["channel"].get("name", "")
-            if name:
-                return f"Slack #{name}"
+            raw_name = d["channel"].get("name", "")
+            if raw_name:
+                return format_channel_name(raw_name)
     except Exception:
         log.warning("Could not resolve Slack channel %s", channel_id)
-    return "Slack"
+    return ""
 
 
 _USER_RE    = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]+)?>")
@@ -258,7 +290,6 @@ def buffer_slack_message(event: dict):
         _buffers.setdefault(key, []).append(text)
         if key in _timers:
             _timers[key].cancel()
-        # CHANGED: pass channel_id into flush_buffer so we can resolve the name
         timer = threading.Timer(_BUFFER_WINDOW, flush_buffer, args=(key, user_id, channel))
         timer.daemon = True
         _timers[key] = timer
@@ -273,10 +304,9 @@ def flush_buffer(key: str, user_id: str, channel_id: str = ""):
         return
     combined = "\n".join(texts)
     sender   = resolve_slack_user(user_id)
-    # CHANGED: resolve channel name for the source column
-    source   = resolve_slack_channel(channel_id)
+    channel  = resolve_slack_channel(channel_id)
     for task in extract_tasks(combined):
-        append_task(task, source=source, sender=sender)
+        append_task(task, source="Slack", sender=sender, channel=channel)
 
 
 @app.post("/webhook/slack")
@@ -287,16 +317,13 @@ async def slack_webhook(request: Request, background: BackgroundTasks):
     except json.JSONDecodeError:
         return Response(status_code=400)
 
-    # 1) URL verification handshake.
     if payload.get("type") == "url_verification":
         return {"challenge": payload.get("challenge", "")}
 
-    # 2) Verify signature.
     if not verify_slack_signature(body, request.headers):
         log.warning("Rejected Slack request: bad signature")
         return Response(status_code=403)
 
-    # 3) Process message events.
     if payload.get("type") == "event_callback":
         event = payload.get("event", {})
         event_type = event.get("type", "")
@@ -351,7 +378,7 @@ def handle_outlook_notification(note: dict):
         preview = msg.get("bodyPreview", "")
         sender  = ((msg.get("from") or {}).get("emailAddress") or {}).get("name", "")
         for task in extract_tasks(f"Subject: {subject}\n\n{preview}"):
-            append_task(task, source="Outlook", sender=sender)
+            append_task(task, source="Outlook", sender=sender, channel="")
     except Exception as e:
         log.exception("Outlook handling failed: %s", e)
 
