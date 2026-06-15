@@ -52,33 +52,49 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 # ---------------------------------------------------------------------------
 
 def format_date(date_str: str) -> str:
-    """Convert a date string from Claude into 'Monday (6/15/2026)' or
-    'Monday (6/15/2026) @ 11:30 AM PST' depending on whether a time is present."""
+    """Convert a date string from Claude into 'Monday (6/15/2026)'
+    or 'Monday (6/15/2026) @ 11:30 AM PST' if a time is present."""
     if not date_str:
         return ""
-    # Try with time first
+    # Try with time first (Claude returns 'YYYY-MM-DD h:mm AM/PM')
     for fmt in ("%Y-%m-%d %I:%M %p", "%Y-%m-%d %H:%M"):
         try:
             dt = datetime.strptime(date_str.strip(), fmt)
-            return dt.strftime("%A (%-m/%-d/%Y) @ %-I:%M %p PST")
+            month = str(dt.month)
+            day   = str(dt.day)
+            year  = str(dt.year)
+            hour  = str(dt.hour % 12 or 12)
+            minute = dt.strftime("%M")
+            ampm  = dt.strftime("%p")
+            return f"{dt.strftime('%A')} ({month}/{day}/{year}) @ {hour}:{minute} {ampm} PST"
         except ValueError:
             pass
     # Try date only
     try:
         dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-        return dt.strftime("%A (%-m/%-d/%Y)")
+        month = str(dt.month)
+        day   = str(dt.day)
+        year  = str(dt.year)
+        return f"{dt.strftime('%A')} ({month}/{day}/{year})"
     except ValueError:
         pass
-    # Return as-is if we can't parse it
     return date_str
 
+
 def format_assigned_time() -> str:
-    """Current Pacific time formatted as 'Monday (6/15/2026) @ 11:30 AM PST'."""
-    now = datetime.now(PACIFIC)
-    return now.strftime("%A (%-m/%-d/%Y) @ %-I:%M %p PST")
+    """Current Pacific time as 'Monday (6/15/2026) @ 11:30 AM PST'."""
+    now    = datetime.now(PACIFIC)
+    month  = str(now.month)
+    day    = str(now.day)
+    year   = str(now.year)
+    hour   = str(now.hour % 12 or 12)
+    minute = now.strftime("%M")
+    ampm   = now.strftime("%p")
+    return f"{now.strftime('%A')} ({month}/{day}/{year}) @ {hour}:{minute} {ampm} PST"
+
 
 def format_channel_name(raw: str) -> str:
-    """Convert a Slack channel name like 'general-tasks' to 'General Tasks'."""
+    """Convert 'general-tasks' to 'General Tasks'."""
     return " ".join(word.capitalize() for word in raw.replace("-", " ").replace("_", " ").split())
 
 # ---------------------------------------------------------------------------
@@ -105,13 +121,14 @@ def append_task(task: dict, source: str, sender: str, channel: str = ""):
     assigned = task.get("assigned_to") or "Admin"
 
     row = [
-        task.get("description", ""),   # A  Action
-        assigned,                      # B  Person Assigned
+        task.get("description", ""),            # A  Action
+        assigned,                               # B  Person Assigned
         format_date(task.get("due_date", "")),  # C  Due Date (PST)
-        format_assigned_time(),        # D  Time Assigned
-        sender or "",                  # E  Assigner
-        channel,                       # F  Channel
-        source,                        # G  Source
+        format_assigned_time(),                 # D  Time Assigned
+        sender or "",                           # E  Assigner
+        channel,                               # F  Channel
+        source,                                # G  Source
+        # H (Done checkbox) is left for the user to manage manually
     ]
 
     ws.append_row(row, value_input_option="USER_ENTERED")
@@ -151,17 +168,17 @@ def extract_tasks(text: str):
     if not text or not text.strip():
         return []
 
-    now   = datetime.now(PACIFIC)
-    today = now.strftime("%A, %Y-%m-%d %I:%M %p %Z")
+    now      = datetime.now(PACIFIC)
+    today    = now.strftime("%A, %Y-%m-%d %I:%M %p %Z")
     user_msg = f"Current date and time: {today}\n\nMessage(s):\n{text}"
 
     try:
         resp = httpx.post(
             "https://api.anthropic.com/v1/messages",
             headers={
-                "x-api-key":          ANTHROPIC_API_KEY,
-                "anthropic-version":  "2023-06-01",
-                "content-type":       "application/json",
+                "x-api-key":         ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
             },
             json={
                 "model":      ANTHROPIC_MODEL,
@@ -281,10 +298,10 @@ def buffer_slack_message(event: dict):
     if not text.strip():
         return
 
-    channel  = event.get("channel", "")
-    user_id  = event.get("user", "")
-    thread   = event.get("thread_ts", event.get("ts", ""))
-    key      = f"{channel}:{user_id}:{thread}"
+    channel = event.get("channel", "")
+    user_id = event.get("user", "")
+    thread  = event.get("thread_ts", event.get("ts", ""))
+    key     = f"{channel}:{user_id}:{thread}"
 
     with _buffer_lock:
         _buffers.setdefault(key, []).append(text)
@@ -325,9 +342,8 @@ async def slack_webhook(request: Request, background: BackgroundTasks):
         return Response(status_code=403)
 
     if payload.get("type") == "event_callback":
-        event = payload.get("event", {})
+        event      = payload.get("event", {})
         event_type = event.get("type", "")
-
         is_message = event_type == "message"
         is_reply   = event_type == "message" and event.get("thread_ts") and event.get("thread_ts") != event.get("ts")
 
