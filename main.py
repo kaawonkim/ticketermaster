@@ -163,7 +163,8 @@ def append_task(task: dict, source: str, sender: str, channel: str = ""):
 
     # Insert a checkbox in column H for the Done column
     sheet_id = ws._properties["sheetId"]
-    gc.batch_update(GOOGLE_SHEET_ID, {"requests": [
+    spreadsheet = gc.open_by_key(GOOGLE_SHEET_ID)
+    spreadsheet.batch_update({"requests": [
         {
             "repeatCell": {
                 "range": {
