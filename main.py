@@ -54,17 +54,31 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
 def format_date(date_str: str) -> str:
     """Convert a date string from Claude into 'Monday (6/15/2026)'
     or 'Monday (6/15/2026) @ 11:30 AM PST' if a time is present.
-    Shorthand like 'EOD', 'ASAP', 'EOW' are passed through as-is."""
+    EOD/ASAP/EOW become 'Monday (6/15/2026) @ EOD' etc."""
     if not date_str:
         return ""
-    # Pass through plain shorthand that shouldn't be parsed as a date
-    SHORTHANDS = {"EOD", "ASAP", "EOW", "TBD"}
-    if date_str.strip().upper() in SHORTHANDS:
-        return date_str.strip().upper()
-    # Try with time first (Claude returns 'YYYY-MM-DD h:mm AM/PM')
+    stripped = date_str.strip()
+
+    # Check for shorthands — Claude may return '2026-06-15 EOD' or just 'EOD'
+    SHORTHANDS = ["EOD", "ASAP", "EOW"]
+    for shorthand in SHORTHANDS:
+        if shorthand in stripped.upper():
+            date_match = re.search(r"\d{4}-\d{2}-\d{2}", stripped)
+            if date_match:
+                try:
+                    dt = datetime.strptime(date_match.group(), "%Y-%m-%d")
+                    month = str(dt.month)
+                    day   = str(dt.day)
+                    year  = str(dt.year)
+                    return f"{dt.strftime('%A')} ({month}/{day}/{year}) @ {shorthand}"
+                except ValueError:
+                    pass
+            return shorthand
+
+    # Try with time (Claude returns 'YYYY-MM-DD h:mm AM/PM')
     for fmt in ("%Y-%m-%d %I:%M %p", "%Y-%m-%d %H:%M"):
         try:
-            dt = datetime.strptime(date_str.strip(), fmt)
+            dt = datetime.strptime(stripped, fmt)
             month  = str(dt.month)
             day    = str(dt.day)
             year   = str(dt.year)
@@ -74,15 +88,17 @@ def format_date(date_str: str) -> str:
             return f"{dt.strftime('%A')} ({month}/{day}/{year}) @ {hour}:{minute} {ampm} PST"
         except ValueError:
             pass
+
     # Try date only
     try:
-        dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        dt = datetime.strptime(stripped, "%Y-%m-%d")
         month = str(dt.month)
         day   = str(dt.day)
         year  = str(dt.year)
         return f"{dt.strftime('%A')} ({month}/{day}/{year})"
     except ValueError:
         pass
+
     return date_str
 
 
@@ -117,7 +133,9 @@ def _service_account_info():
 
 
 def append_task(task: dict, source: str, sender: str, channel: str = ""):
-    """Append one task as a row in the Google Sheet."""
+    """Append one task as a row in the Google Sheet.
+    Finds the first truly empty row in column A to avoid being pushed down
+    by checkboxes or formatting in other columns."""
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds  = Credentials.from_service_account_info(_service_account_info(), scopes=scopes)
     gc     = gspread.authorize(creds)
@@ -125,7 +143,7 @@ def append_task(task: dict, source: str, sender: str, channel: str = ""):
 
     assigned = task.get("assigned_to") or "Admin"
 
-    row = [
+    row_data = [
         task.get("description", ""),            # A  Action
         assigned,                               # B  Person Assigned
         format_date(task.get("due_date", "")),  # C  Due Date (PST)
@@ -133,11 +151,16 @@ def append_task(task: dict, source: str, sender: str, channel: str = ""):
         sender or "",                           # E  Assigner
         channel,                               # F  Channel
         source,                                # G  Source
-        # H (Done checkbox) is left for the user to manage manually
+        # H (Done checkbox) managed manually
     ]
 
-    ws.append_row(row, value_input_option="USER_ENTERED")
-    log.info("Added task from %s: %s", source, task.get("description", "")[:80])
+    # Find first empty row by looking at column A values only
+    col_a = ws.col_values(1)  # all values in column A
+    next_row = len(col_a) + 1  # first row after last non-empty cell in col A
+
+    # Write directly to that row
+    ws.update(f"A{next_row}:G{next_row}", [row_data], value_input_option="USER_ENTERED")
+    log.info("Added task at row %d from %s: %s", next_row, source, task.get("description", "")[:80])
 
 # ---------------------------------------------------------------------------
 # Claude task extraction
@@ -157,16 +180,17 @@ SYSTEM_PROMPT = (
     "suggests someone should do something, treat it as a task. "
     "Merge fragments that describe the SAME task into one entry; only create separate "
     "entries for genuinely different tasks. "
-    "For due_date: if the message says 'EOD', return exactly 'EOD'; "
-    "if it says 'ASAP', return 'ASAP'; if it says 'end of week' or 'EOW', return 'EOW'. "
+    "For due_date: if the message says 'EOD', return 'YYYY-MM-DD EOD' using today's date; "
+    "if it says 'ASAP', return 'ASAP'; if it says 'end of week' or 'EOW', return 'YYYY-MM-DD EOW' "
+    "using the date of the coming Friday. "
     "Otherwise, if a specific time is given, use 'YYYY-MM-DD h:mm AM/PM' "
     "(e.g. '2026-06-12 4:00 PM'); if only a day is given, use 'YYYY-MM-DD'; "
     "if no deadline is stated, use ''. "
     "assigned_to: use the name of the person responsible if mentioned or clearly implied. "
     "If the message is directed at a specific person (e.g. '@John can you...'), assign it to them. "
     "If truly unclear, leave assigned_to as '' and the system will assign it to Admin. "
-    "Resolve relative dates and times (e.g. 'Friday', 'tomorrow', '4pm Friday', "
-    "'EOD') against the provided current date and time."
+    "Resolve relative dates and times (e.g. 'Friday', 'tomorrow', '4pm Friday') "
+    "against the provided current date and time."
 )
 
 
